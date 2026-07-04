@@ -352,6 +352,21 @@ class VllmModelWrapper:
         self.model = _VllmRunner(vllm_model)
         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
 
+        # Slice rotary cos_sin_cache buffers to max_model_len to save HBM usage
+        # and reduce the per-step overhead of the XLA layout copy.
+        if envs.SLICE_ROPE_CACHE:
+            max_len = self.vllm_config.model_config.max_model_len
+            for key, val in list(params_and_buffers.items()):
+                if key.endswith("rotary_emb.cos_sin_cache"):
+                    arr = jax_view(val)
+                    if arr.shape[0] > max_len:
+                        params_and_buffers[key] = torch_view(arr[:max_len])
+                        logger.info(
+                            "Sliced rope cache %s rows %d -> %d, because "
+                            "max_model_len is %d so decode never gathers "
+                            "positions beyond it (the tail is dead weight)",
+                            key, arr.shape[0], max_len, max_len)
+
         self._pooler: Pooler | None = self.model.pooler
 
         if self.vllm_config.model_config.is_multimodal_model:
